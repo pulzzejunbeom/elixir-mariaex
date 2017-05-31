@@ -32,8 +32,9 @@ defimpl DBConnection.Query, for: Mariaex.Query do
 
   This function is called to parse a query term before it is prepared.
   """
-  def parse(%{name: name, statement: statement, ref: nil} = query, _) do
-    %{query | name: IO.iodata_to_binary(name), statement: IO.iodata_to_binary(statement)}
+  def parse(%{statement: statement, ref: nil} = query, _) do
+    # force name to be ""
+    %{query | name: "", statement: IO.iodata_to_binary(statement)}
   end
 
   @doc """

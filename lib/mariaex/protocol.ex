@@ -14,7 +14,7 @@ defmodule Mariaex.Protocol do
 
   @reserved_prefix "MARIAEX_"
   @timeout 5000
-  @cache_size 100
+  @cache_size 2
   @max_rows 500
 
   @maxpacketbytes 50000000
