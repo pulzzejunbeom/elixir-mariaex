@@ -50,7 +50,7 @@ defmodule Mariaex.Protocol do
   defstruct sock: nil,
             state: nil,
             state_data: nil,
-            protocol57: false,
+            deprecated_eof: false,
             binary_as: nil,
             connection_id: nil,
             opts: [],
@@ -61,6 +61,8 @@ defmodule Mariaex.Protocol do
             cache: nil,
             cursors: %{},
             seqnum: 0,
+            datetime: :structs,
+            json_library: Poison,
             ssl_conn_state: :undefined  #  :undefined | :not_used | :ssl_handshake | :connected
 
   @doc """
@@ -71,9 +73,17 @@ defmodule Mariaex.Protocol do
     opts         = default_opts(opts)
     sock_type    = opts[:sock_type] |> Atom.to_string |> String.capitalize()
     sock_mod     = Module.concat(Mariaex.Connection, sock_type)
-    host         = opts[:hostname] |> parse_host
-    connect_opts = [host, opts[:port], opts[:socket_options], opts[:timeout]]
+    {host, port} =
+      case Keyword.fetch(opts, :socket) do
+        {:ok, socket} ->
+          {{:local, socket}, 0}
+        :error ->
+          {parse_host(opts[:hostname]), opts[:port]}
+      end
+    connect_opts = [host, port, opts[:socket_options], opts[:timeout]]
     binary_as    = opts[:binary_as] || :field_type_var_string
+    datetime     = opts[:datetime] || :structs
+    json_library = Application.get_env(:mariaex, :json_library, Poison)
 
     case apply(sock_mod, :connect, connect_opts) do
       {:ok, sock} ->
@@ -85,6 +95,8 @@ defmodule Mariaex.Protocol do
                         cache: reset_cache(),
                         lru_cache: reset_lru_cache(opts[:cache_size]),
                         timeout: opts[:timeout],
+                        datetime: datetime,
+                        json_library: json_library,
                         opts: opts}
         handshake_recv(s, %{opts: opts})
       {:error, reason} ->
@@ -126,7 +138,7 @@ defmodule Mariaex.Protocol do
   end
 
   defp parse_host(host) do
-    host = if is_binary(host), do: String.to_char_list(host), else: host
+    host = if is_binary(host), do: String.to_charlist(host), else: host
 
     case :inet.parse_strict_address(host) do
       {:ok, address} ->
@@ -154,7 +166,11 @@ defmodule Mariaex.Protocol do
   defp handshake_recv(state, request) do
     case msg_recv(state) do
       {:ok, packet, state} ->
-        handle_handshake(packet, request, state)
+        case handle_handshake(packet, request, state) do
+          {:error, error} ->
+            do_disconnect(state, error, "") |> connected()
+          other -> other
+        end
       {:error, reason} ->
         {sock_mod, _} = state.sock
         Mariaex.Protocol.do_disconnect(state, {sock_mod.tag, "recv", reason, ""}) |> connected()
@@ -181,15 +197,12 @@ defmodule Mariaex.Protocol do
         {:error, error}
     end
   end
-  defp handle_handshake(packet(seqnum: seqnum, msg: handshake(server_version: server_version, plugin: plugin) = handshake) = _packet,  %{opts: opts}, s) do
-    ## It is a little hack here. Because MySQL before 5.7.5 (at least, I need to assume this or test it with versions 5.7.X, where X < 5),
-    ## but all points in documentation to changes shows, that changes done in 5.7.5, but haven't tested it further.
-    ## In a phase of getting binary protocol resultset ( https://dev.mysql.com/doc/internals/en/binary-protocol-resultset.html )
-    ## we get in versions before 5.7.X eof packet after last ColumnDefinition and one for the ending of query.
-    ## That means, without differentiation of MySQL versions, we can't know, if eof after last column definition
-    ## is resulting eof after result set (which can be none) or simple information, that now results will be coming.
-    ## Due to this, we need to difference server version.
-    protocol57 = get_3_digits_version(server_version) |> Version.match?("~> 5.7.5")
+  defp handle_handshake(packet(seqnum: seqnum,
+                               msg: handshake(capability_flags_1: flag1,
+                                              capability_flags_2: flag2,
+                                              plugin: plugin) = handshake) = _packet,  %{opts: opts}, s) do
+    <<flag :: size(32)>> = <<flag2 :: size(16), flag1 :: size(16)>>
+    deprecated_eof = (flag &&& @client_deprecate_eof) == @client_deprecate_eof
     handshake(auth_plugin_data1: salt1, auth_plugin_data2: salt2) = handshake
     scramble = case password = opts[:password] do
       nil -> ""
@@ -201,7 +214,7 @@ defmodule Mariaex.Protocol do
                          database: database, capability_flags: capabilities,
                          max_size: @maxpacketbytes, character_set: 8)
     msg_send(msg, s, seqnum + 1)
-    handshake_recv(%{s | state: :handshake_send, protocol57: protocol57}, nil)
+    handshake_recv(%{s | state: :handshake_send, deprecated_eof: deprecated_eof}, nil)
   end
   defp handle_handshake(packet(msg: ok_resp(affected_rows: _affected_rows, last_insert_id: _last_insert_id) = _packet), nil, state) do
     statement = "SET CHARACTER SET " <> (state.opts[:charset] || "utf8")
@@ -256,7 +269,7 @@ defmodule Mariaex.Protocol do
       {:ok, packet(msg: _), _state} ->
         sock_mod.close(sock)
       {:error, _} ->
-        :ok
+        sock_mod.close(sock)
     end
     _ = sock_mod.recv_active(sock, 0, "")
     :ok
@@ -314,15 +327,16 @@ defmodule Mariaex.Protocol do
   def handle_prepare(%Query{name: @reserved_prefix <> _} = query, _, s) do
     reserved_error(query, s)
   end
-  def handle_prepare(%Query{type: nil, statement: statement} = query, opts, s) do
-    command = get_command(statement)
-    handle_prepare(%{query | type: request_type(command), binary_as: s.binary_as}, opts, s)
+  def handle_prepare(%Query{type: nil} = query, opts, s) do
+    case handle_prepare(%Query{query | type: :binary}, opts, s) do
+      {:error,  %Mariaex.Error{mariadb: %{code: 1295}}, s} ->
+        {:ok, %Query{query | type: :text, ref: make_ref(), num_params: 0}, s}
+      other ->
+        other
+    end
   end
-  def handle_prepare(%Query{type: :text} = query, _, s) do
-    {:ok, %Query{query | ref: make_ref(), num_params: 0}, s}
-  end
-  def handle_prepare(%Query{type: :binary} = query, _, s) do
-    case prepare_lookup(query, s) do
+  def handle_prepare(%Query{type: :binary} = query, _, %{binary_as: binary_as} = s) do
+    case prepare_lookup(%Query{query | binary_as: binary_as}, s) do
       {:prepared, query} ->
         {:ok, query, s}
       {:prepare, query} ->
@@ -331,13 +345,9 @@ defmodule Mariaex.Protocol do
         close_prepare(id, query, s)
     end
   end
-
-  defp request_type(command) do
-    if command in [:insert, :select, :update, :delete, :replace, :show, :call, :describe] do
-      :binary
-    else
-      :text
-    end
+  def handle_prepare(%Query{type: _} = query, _, s) do
+    error = ArgumentError.exception("query #{inspect query} is already prepared")
+    {:error, error, s}
   end
 
   defp prepare_lookup(%Query{name: "", statement: statement} = query, %{lru_cache: cache}) do
@@ -404,10 +414,10 @@ defmodule Mariaex.Protocol do
         other
     end
   end
-  defp do_skip_definitions(%{protocol57: true} = state, 0) do
+  defp do_skip_definitions(%{deprecated_eof: true} = state, 0) do
     {:eof, state}
   end
-  defp do_skip_definitions(%{protocol57: false} = state, 0) do
+  defp do_skip_definitions(%{deprecated_eof: false} = state, 0) do
     case msg_recv(state) do
       {:ok, packet(msg: eof_resp()), state} ->
         {:eof, state}
@@ -445,9 +455,6 @@ defmodule Mariaex.Protocol do
       {:close_prepare_execute, id, query} ->
         prepare_execute(&close_prepare(id, query, &1), params, state)
     end
-  end
-  def handle_execute(query, params, _opts, state) do
-    query_error(state, "unsupported parameterized query #{inspect(query.statement)} parameters #{inspect(params)}")
   end
 
   defp execute_lookup(%Query{name: ""} = query, %{lru_cache: cache}) do
@@ -501,7 +508,8 @@ defmodule Mariaex.Protocol do
   defp text_query_recv(state, query) do
     case text_query_recv(state) do
       {:resultset, columns, rows, _flags, state} ->
-        {:ok, {%Mariaex.Result{rows: rows}, columns}, clean_state(state)}
+        result = %Mariaex.Result{rows: rows, connection_id: state.connection_id}
+        {:ok, {result, columns}, clean_state(state)}
       {:ok, packet(msg: ok_resp()) = packet, state} ->
         handle_ok_packet(packet, query, state)
       {:ok, packet, state} ->
@@ -532,8 +540,8 @@ defmodule Mariaex.Protocol do
     end
   end
 
-  defp text_row_decode(s, fields, rows, buffer) do
-    case decode_text_rows(buffer, fields, rows) do
+  defp text_row_decode(%{datetime: datetime, json_library: json_library} = s, fields, rows, buffer) do
+    case decode_text_rows(buffer, fields, rows, datetime, json_library) do
       {:ok, packet, rows, rest} ->
         {:ok, packet, rows, %{s | buffer: rest}}
       {:more, rows, rest} ->
@@ -592,10 +600,10 @@ defmodule Mariaex.Protocol do
         other
     end
   end
-  defp columns_recv(%{protocol57: true} = state, 0, columns) do
+  defp columns_recv(%{deprecated_eof: true} = state, 0, columns) do
     {:eof, Enum.reverse(columns), 0, state}
   end
-  defp columns_recv(%{protocol57: false} = state, 0, columns) do
+  defp columns_recv(%{deprecated_eof: false} = state, 0, columns) do
     case msg_recv(state) do
       {:ok, packet(msg: eof_resp(status_flags: flags)), state} ->
         {:eof, Enum.reverse(columns), flags, state}
@@ -621,14 +629,16 @@ defmodule Mariaex.Protocol do
       (flags &&& @server_more_results_exists) == @server_more_results_exists ->
         binary_query_more(state, query, columns, rows)
       true ->
-        {:ok, {%Mariaex.Result{rows: rows}, columns}, clean_state(state)}
+        result = %Mariaex.Result{rows: rows, connection_id: state.connection_id}
+        {:ok, {result, columns}, clean_state(state)}
     end
   end
 
   defp binary_query_more(state, query, columns, rows) do
     case msg_recv(state) do
       {:ok, packet(msg: ok_resp(affected_rows: affected_rows, last_insert_id: last_insert_id)), state} ->
-        result = %Mariaex.Result{rows: rows, num_rows: affected_rows, last_insert_id: last_insert_id}
+        result = %Mariaex.Result{rows: rows, num_rows: affected_rows,
+          last_insert_id: last_insert_id, connection_id: state.connection_id}
         {:ok, {result, columns}, clean_state(state)}
       {:ok, packet, state} ->
         handle_error(packet, query, state)
@@ -637,8 +647,8 @@ defmodule Mariaex.Protocol do
     end
   end
 
-  defp binary_row_decode(s, fields, nullbin_size, rows, buffer) do
-    case decode_bin_rows(buffer, fields, nullbin_size, rows) do
+  defp binary_row_decode(%{datetime: datetime, json_library: json_library} = s, fields, nullbin_size, rows, buffer) do
+    case decode_bin_rows(buffer, fields, nullbin_size, rows, datetime, json_library) do
       {:ok, packet, rows, rest} ->
         {:ok, packet, rows, %{s | buffer: rest}}
       {:more, rows, rest} ->
@@ -659,7 +669,9 @@ defmodule Mariaex.Protocol do
   end
 
   defp handle_ok_packet(packet(msg: ok_resp(affected_rows: affected_rows, last_insert_id: last_insert_id)), _query, s) do
-    {:ok, {%Mariaex.Result{columns: [], rows: nil, num_rows: affected_rows, last_insert_id: last_insert_id}, nil}, clean_state(s)}
+    result = %Mariaex.Result{columns: [], rows: nil, num_rows: affected_rows,
+      last_insert_id: last_insert_id, connection_id: s.connection_id}
+    {:ok, {result, nil}, clean_state(s)}
   end
 
   defp clean_state(state) do
@@ -708,7 +720,7 @@ defmodule Mariaex.Protocol do
         declare(id, params, opts, state)
       {:prepare_declare, query} ->
         prepare_declare(&prepare(query, &1), params, opts, state)
-      {:close_prepare_execute, id, query} ->
+      {:close_prepare_declare, id, query} ->
         prepare_declare(&close_prepare(id, query, &1), params, opts, state)
       {:text, _} ->
         cursor = %Cursor{statement_id: :text, params: params, ref: make_ref()}
@@ -806,9 +818,9 @@ defmodule Mariaex.Protocol do
       (flags &&& @server_status_cursor_exists) == @server_status_cursor_exists ->
         %{cursors: cursors} = state
         state = clean_state(%{state | cursors: Map.put(cursors, ref, columns)})
-        {:ok, {%Mariaex.Result{rows: rows}, columns}, state}
+        {:ok, {%Mariaex.Result{rows: rows, connection_id: state.connection_id}, columns}, state}
       true ->
-        {:deallocate, {%Mariaex.Result{rows: rows}, columns}, clean_state(state)}
+        {:deallocate, {%Mariaex.Result{rows: rows, connection_id: state.connection_id}, columns}, clean_state(state)}
     end
   end
 
@@ -841,9 +853,9 @@ defmodule Mariaex.Protocol do
   defp binary_next_resultset(state, columns, rows, flags) do
     cond do
       (flags &&& @server_status_last_row_sent) == @server_status_last_row_sent ->
-        {:deallocate, {%Mariaex.Result{rows: rows}, columns}, clean_state(state)}
+        {:deallocate, {%Mariaex.Result{rows: rows, connection_id: state.connection_id}, columns}, clean_state(state)}
       (flags &&& @server_status_cursor_exists) == @server_status_cursor_exists ->
-        {:ok, {%Mariaex.Result{rows: rows}, columns}, clean_state(state)}
+        {:ok, {%Mariaex.Result{rows: rows, connection_id: state.connection_id}, columns}, clean_state(state)}
     end
   end
 
@@ -1022,7 +1034,7 @@ defmodule Mariaex.Protocol do
     l |> Enum.map(&bxor(&1, extra - 64)) |> to_string
   end
 
-  defp hash(bin) when is_binary(bin), do: bin |> to_char_list |> hash
+  defp hash(bin) when is_binary(bin), do: bin |> to_charlist |> hash
   defp hash(s), do: hash(s, 1345345333, 305419889, 7)
   defp hash([c | s], n1, n2, add) do
     n1 = bxor(n1, (((band(n1, 63) + add) * c + n1 * 256)))
@@ -1136,12 +1148,11 @@ defmodule Mariaex.Protocol do
     %{s | state: :column_count}
   end
 
-  defp query_error(s, msg) do
-    {:error, ArgumentError.exception(msg), s}
-  end
-
   defp abort_statement(s, query, code, message) do
-    abort_statement(s, query, %Mariaex.Error{mariadb: %{code: code, message: message}})
+    abort_statement(s, query, %Mariaex.Error{
+      mariadb: %{code: code, message: message},
+      connection_id: s.connection_id
+    })
   end
   defp abort_statement(s, query, error = %Mariaex.Error{}) do
     case query do
@@ -1156,27 +1167,5 @@ defmodule Mariaex.Protocol do
   defp reserved_error(query, s) do
     error = ArgumentError.exception("query #{inspect query} uses reserved name")
     {:error, error, s}
-  end
-
-  @doc """
-  Get command from statement
-  """
-  def get_command(statement) when is_binary(statement) do
-    statement |> :binary.split([" ", "\n"]) |> hd |> String.downcase |> String.to_atom
-  end
-  def get_command(nil), do: nil
-
-  def get_3_digits_version(string) do
-    [major, minor, rest] = String.split(string, ".", parts: 3)
-    bugfix = digits(rest)
-    "#{major}.#{minor}.#{bugfix}"
-  end
-
-  defp digits(string, acc \\ [])
-  defp digits(<<c, rest :: binary>>, acc) when c >= ?0 and c <= ?9 do
-    digits(rest, [c | acc])
-  end
-  defp digits(_, acc) do
-    acc |> Enum.reverse()
   end
 end

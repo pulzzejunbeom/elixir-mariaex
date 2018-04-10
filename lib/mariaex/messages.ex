@@ -21,7 +21,7 @@ defmodule Mariaex.Messages do
                   constraint: ?n, file: ?F, line: ?L, routine: ?R ]
   _ = @error_fields # Drop warning for now
 
-  @commands [ com_sleep: 0x00, com_quit: 0x01, com_init_bd: 0x02,
+  @commands [ com_sleep: 0x00, com_quit: 0x01, com_init_db: 0x02,
               com_query: 0x03, com_field_list: 0x04, com_create_db: 0x05,
               com_drop_db: 0x06, com_refresh: 0x07, com_shutdown: 0x08,
               com_statistics: 0x09, com_process_info: 0x0a, com_connect: 0x0b,
@@ -67,6 +67,10 @@ defmodule Mariaex.Messages do
             field_type_blob: 0xfc,
             field_type_var_string: 0xfd,
             field_type_string: 0xfe],
+          json:
+           [field_type_json: 0xf5],
+          geometry:
+            [field_type_geometry: 0xff],
           null:
            [field_type_null: 0x06]
          ]
@@ -229,32 +233,32 @@ defmodule Mariaex.Messages do
     do: {nil, rest}
 
   def decode_bin_rows(<< len :: size(24)-little-integer, seqnum :: size(8)-integer, body :: size(len)-binary, rest :: binary>>,
-                      fields, nullbin_size, rows) do
+                      fields, nullbin_size, rows, datetime, json_library) do
     case body do
       <<0 :: 8, nullbin::size(nullbin_size)-little-unit(8), values :: binary>> ->
-        row = Mariaex.RowParser.decode_bin_rows(values, fields, nullbin)
-        decode_bin_rows(rest, fields, nullbin_size, [row | rows])
+        row = Mariaex.RowParser.decode_bin_rows(values, fields, nullbin, datetime, json_library)
+        decode_bin_rows(rest, fields, nullbin_size, [row | rows], datetime, json_library)
       body ->
         msg = decode_msg(body, :bin_rows)
         {:ok, packet(size: len, seqnum: seqnum, msg: msg, body: body), rows, rest}
     end
   end
-  def decode_bin_rows(<<rest :: binary>>, _fields, _nullbin_size, rows) do
+  def decode_bin_rows(<<rest :: binary>>, _fields, _nullbin_size, rows, _datetime, _json_library) do
     {:more, rows, rest}
   end
 
   def decode_text_rows(<< len :: size(24)-little-integer, seqnum :: size(8)-integer, body :: size(len)-binary, rest :: binary>>,
-                      fields, rows) do
+                      fields, rows, datetime, json_library) do
     case body do
       << 254 :: 8, _ :: binary >> = body when byte_size(body) < 9 ->
         msg = decode_msg(body, :text_rows)
         {:ok, packet(size: len, seqnum: seqnum, msg: msg, body: body), rows, rest}
       body ->
-        row = Mariaex.RowParser.decode_text_rows(body, fields)
-        decode_text_rows(rest, fields, [row | rows])
+        row = Mariaex.RowParser.decode_text_rows(body, fields, datetime, json_library)
+        decode_text_rows(rest, fields, [row | rows], datetime, json_library)
     end
   end
-  def decode_text_rows(<<rest :: binary>>, _fields, rows) do
+  def decode_text_rows(<<rest :: binary>>, _fields, rows, _datetime, _json_library) do
     {:more, rows, rest}
   end
 
@@ -280,6 +284,6 @@ defmodule Mariaex.Messages do
                           << contents :: size(length_nul_terminated)-binary, 0 :: 8 >> -> contents
                           contents -> contents
                         end
-    {String.strip(auth_plugin_data2, 0), next}
+    {String.trim(auth_plugin_data2, "\0"), next}
   end
 end

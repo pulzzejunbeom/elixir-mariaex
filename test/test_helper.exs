@@ -1,27 +1,53 @@
-ExUnit.configure exclude: [:ssl_tests]
+mdb_socket = System.get_env("MDBSOCKET")
+
+socket? =
+  match?({:unix, _}, :os.type()) and List.to_integer(:erlang.system_info(:otp_release)) >= 19 and
+    is_binary(mdb_socket) and File.exists?(mdb_socket)
+
+ExUnit.configure(
+  exclude: [
+    ssl_tests: true,
+    json: System.get_env("JSON_SUPPORT") != "true",
+    socket: not socket?,
+    geometry: System.get_env("GEOMETRY_SUPPORT") == "false"
+  ]
+)
+
 ExUnit.start()
 
 run_cmd = fn cmd ->
   key = :ecto_setup_cmd_output
   Process.put(key, "")
-  status = Mix.Shell.cmd(cmd, fn(data) ->
-    current = Process.get(key)
-    Process.put(key, current <> data)
-  end)
+  # TODO: Not relay on Mix.Shell.cmd
+  cmd_fun =
+    cond do
+      function_exported?(Mix.Shell, :cmd, 2) -> &Mix.Shell.cmd/2
+      function_exported?(Mix.Shell, :cmd, 3) -> &Mix.Shell.cmd(&1, [], &2)
+    end
+
+  status =
+    cmd_fun.(cmd, fn data ->
+      current = Process.get(key)
+      Process.put(key, current <> data)
+    end)
+
   output = Process.get(key)
   Process.put(key, "")
   {status, output}
 end
 
-mysql_pass_switch = if mysql_root_pass = System.get_env("MYSQL_ROOT_PASSWORD") do
-  "-p#{mysql_root_pass}"
-else
-  ""
-end
+mysql_pass_switch =
+  if mysql_root_pass = System.get_env("MYSQL_ROOT_PASSWORD") do
+    "-p#{mysql_root_pass}"
+  else
+    ""
+  end
 
 mysql_port = System.get_env("MDBPORT") || 3306
 mysql_host = System.get_env("MDBHOST") || "localhost"
-mysql_connect = "-u root #{mysql_pass_switch} --host=#{mysql_host} --port=#{mysql_port} --protocol=tcp"
+
+mysql_connect =
+  "-u root #{mysql_pass_switch} --host=#{mysql_host} --port=#{mysql_port} --protocol=tcp"
 
 sql = """
   CREATE TABLE test1 (id serial, title text);
@@ -30,20 +56,28 @@ sql = """
   DROP TABLE test1;
 """
 
+create_user =
+  case System.get_env("DB") do
+    "mysql:5.6" -> "CREATE USER"
+    _ -> "CREATE USER IF NOT EXISTS"
+  end
+
 cmds = [
-  ~s(mysql #{mysql_connect} -e "GRANT ALL ON *.* TO 'mariaex_user'@'localhost' IDENTIFIED BY 'mariaex_pass';"),
   ~s(mysql #{mysql_connect} -e "DROP DATABASE IF EXISTS mariaex_test;"),
-  ~s(mysql #{mysql_connect} -e "CREATE DATABASE mariaex_test DEFAULT CHARACTER SET 'utf8' COLLATE 'utf8_general_ci'";),
-  ~s(mysql #{mysql_connect} mariaex_test -e "#{sql}"),
-  ~s(mysql --host=#{mysql_host} --port=#{mysql_port} --protocol=tcp -u mariaex_user -pmariaex_pass mariaex_test -e "#{sql}")
+  ~s(mysql #{mysql_connect} -e "CREATE DATABASE mariaex_test DEFAULT CHARACTER SET 'utf8' COLLATE 'utf8_general_ci';"),
+  ~s(mysql #{mysql_connect} -e "#{create_user} 'mariaex_user'@'%' IDENTIFIED BY 'mariaex_pass';"),
+  ~s(mysql #{mysql_connect} -e "GRANT ALL ON *.* TO 'mariaex_user'@'%' WITH GRANT OPTION"),
+  ~s(mysql --host=#{mysql_host} --port=#{mysql_port} --protocol=tcp -u mariaex_user -pmariaex_pass mariaex_test -e "#{
+    sql
+  }")
 ]
 
 Enum.each(cmds, fn cmd ->
   {status, output} = run_cmd.(cmd)
-  IO.puts "--> #{output}"
+  IO.puts("--> #{output}")
 
   if status != 0 do
-    IO.puts """
+    IO.puts("""
     Command:
     #{cmd}
     error'd with:
@@ -53,7 +87,8 @@ Enum.each(cmds, fn cmd ->
     If the "root" user requires a password, set the environment
     variable MYSQL_ROOT_PASSWORD to its value.
     Beware that the password may be visible in the process list!
-    """
+    """)
+
     System.halt(1)
   end
 end)
@@ -61,8 +96,9 @@ end)
 defmodule Mariaex.TestHelper do
   defmacro query(stat, params, opts \\ []) do
     quote do
-      case Mariaex.Connection.query(var!(context)[:pid], unquote(stat),
-                                     unquote(params), unquote(opts)) do
+      pid = var!(context)[:pid]
+
+      case Mariaex.Connection.query(pid, unquote(stat), unquote(params), unquote(opts)) do
         {:ok, %Mariaex.Result{rows: nil}} -> :ok
         {:ok, %Mariaex.Result{rows: rows}} -> rows
         {:error, %Mariaex.Error{} = err} -> err
@@ -72,8 +108,9 @@ defmodule Mariaex.TestHelper do
 
   defmacro execute_text(stat, params, opts \\ []) do
     quote do
-      case Mariaex.execute(var!(context)[:pid], %Mariaex.Query{type: :text, statement: unquote(stat)},
-            unquote(params), unquote(opts)) do
+      opts = [query_type: :text] ++ unquote(opts)
+
+      case Mariaex.query(var!(context)[:pid], unquote(stat), unquote(params), opts) do
         {:ok, %Mariaex.Result{rows: nil}} -> :ok
         {:ok, %Mariaex.Result{rows: rows}} -> rows
         {:error, %Mariaex.Error{} = err} -> err
@@ -85,6 +122,7 @@ defmodule Mariaex.TestHelper do
     quote do
       conn = var!(context)[:pid]
       query = Mariaex.prepare!(conn, unquote(name), unquote(stat), unquote(opts))
+
       case Mariaex.execute!(conn, query, unquote(params)) do
         %Mariaex.Result{rows: nil} -> :ok
         %Mariaex.Result{rows: rows} -> rows
@@ -103,8 +141,7 @@ defmodule Mariaex.TestHelper do
 
   defmacro execute(query, params, opts \\ []) do
     quote do
-      case Mariaex.execute(var!(context)[:pid], unquote(query), unquote(params),
-                           unquote(opts)) do
+      case Mariaex.execute(var!(context)[:pid], unquote(query), unquote(params), unquote(opts)) do
         {:ok, %Mariaex.Result{rows: nil}} -> :ok
         {:ok, %Mariaex.Result{rows: rows}} -> rows
         {:error, %Mariaex.Error{} = err} -> err
@@ -130,5 +167,4 @@ defmodule Mariaex.TestHelper do
   def length_encode_row(row) do
     Enum.map_join(row, &(<<String.length(&1)>> <> &1))
   end
-
 end

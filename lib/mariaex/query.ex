@@ -51,18 +51,18 @@ defimpl DBConnection.Query, for: Mariaex.Query do
 
   This function is called to encode a query before it is executed.
   """
-  def encode(%Mariaex.Query{ref: nil, type: :binary} = query, _params, _opts) do
+  def encode(%Mariaex.Query{type: nil} = query, _params, _opts) do
     raise ArgumentError, "query #{inspect query} has not been prepared"
   end
-  def encode(%Mariaex.Query{type: :binary, num_params: num_params} = query, params, _opts)
+  def encode(%Mariaex.Query{num_params: num_params} = query, params, _opts)
       when length(params) != num_params do
     raise ArgumentError, "parameters must be of length #{num_params} for query #{inspect query}"
   end
   def encode(%Mariaex.Query{type: :binary, binary_as: binary_as}, params, _opts) do
     parameters_to_binary(params, binary_as)
   end
-  def encode(%Mariaex.Query{type: :text}, params, _opts) do
-    params
+  def encode(%Mariaex.Query{type: :text}, [], _opts) do
+    []
   end
 
   defp parameters_to_binary([], _binary_as), do: <<>>
@@ -112,6 +112,20 @@ defimpl DBConnection.Query, for: Mariaex.Query do
     bin = Decimal.to_string(value, :normal)
     {0, :field_type_newdecimal, << to_length_encoded_integer(byte_size(bin)) :: binary, bin :: binary >>}
   end
+
+  defp encode_param(%Date{year: year, month: month, day: day}, _binary_as),
+    do: {0, :field_type_date, << 4::8-little, year::16-little, month::8-little, day::8-little>>}
+  defp encode_param(%Time{hour: hour, minute: min, second: sec, microsecond: {0, 0}}, _binary_as),
+    do: {0, :field_type_time, << 8 :: 8-little, 0 :: 8-little, 0 :: 32-little, hour :: 8-little, min :: 8-little, sec :: 8-little >>}
+  defp encode_param(%Time{hour: hour, minute: min, second: sec, microsecond: {msec, _}}, _binary_as),
+    do: {0, :field_type_time, << 12 :: 8-little, 0 :: 8-little, 0 :: 32-little, hour :: 8-little, min :: 8-little, sec :: 8-little, msec :: 32-little>>}
+  defp encode_param(%NaiveDateTime{year: year, month: month, day: day,
+                                   hour: hour, minute: min, second: sec, microsecond: {0, 0}}, _binary_as),
+    do: {0, :field_type_datetime, << 7::8-little, year::16-little, month::8-little, day::8-little, hour::8-little, min::8-little, sec::8-little>>}
+  defp encode_param(%NaiveDateTime{year: year, month: month, day: day,
+                                   hour: hour, minute: min, second: sec, microsecond: {msec, _}}, _binary_as),
+    do: {0, :field_type_datetime, <<11::8-little, year::16-little, month::8-little, day::8-little, hour::8-little, min::8-little, sec::8-little, msec::32-little>>}
+
   defp encode_param({year, month, day}, _binary_as),
     do: {0, :field_type_date, << 4::8-little, year::16-little, month::8-little, day::8-little>>}
   defp encode_param({hour, min, sec, 0}, _binary_as),
@@ -124,31 +138,46 @@ defimpl DBConnection.Query, for: Mariaex.Query do
     do: {0, :field_type_datetime, << 7::8-little, year::16-little, month::8-little, day::8-little, hour::8-little, min::8-little, sec::8-little>>}
   defp encode_param({{year, month, day}, {hour, min, sec, msec}}, _binary_as),
     do: {0, :field_type_datetime, <<11::8-little, year::16-little, month::8-little, day::8-little, hour::8-little, min::8-little, sec::8-little, msec::32-little>>}
+
+  defp encode_param(%Mariaex.Geometry.Point{coordinates: {x, y}, srid: srid}, _binary_as) do
+    srid = srid || 0
+    endian = 1 # MySQL is always little-endian
+    point_type = 1
+    {0, :field_type_geometry, << 25::8-little, srid::32-little, endian::8-little, point_type::32-little, x::little-float-64, y::little-float-64 >>}
+  end
+
+  defp encode_param(%Mariaex.Geometry.LineString{coordinates: coordinates, srid: srid}, _binary_as) do
+    srid = srid || 0
+    endian = 1 # MySQL is always little-endian
+    linestring_type = 2
+    num_points = length(coordinates)
+    points = encode_coordinates(coordinates)
+    mysql_wkb = << srid::32-little, endian::8-little, linestring_type::32-little, num_points::little-32, points::binary >>
+    encode_param(mysql_wkb, :field_type_geometry)
+  end
+
+  defp encode_param(%Mariaex.Geometry.Polygon{coordinates: coordinates, srid: srid}, _binary_as) do
+    srid = srid || 0
+    endian = 1 # MySQL is always little-endian
+    polygon_type = 3
+    num_rings = length(coordinates)
+    rings = encode_rings(coordinates)
+    mysql_wkb = << srid::32-little, endian::8-little, polygon_type::32-little, num_rings::little-32, rings::binary >>
+    encode_param(mysql_wkb, :field_type_geometry)
+  end
+
   defp encode_param(other, _binary_as),
     do: raise ArgumentError, "query has invalid parameter #{inspect other}"
 
-  @commands_without_rows [:create, :insert, :replace, :update, :delete, :set,
-                          :alter, :rename, :drop, :begin, :commit, :rollback,
-                          :savepoint, :execute, :prepare, :truncate, :grant]
-
-  def decode(%Mariaex.Query{statement: statement}, {res, nil}, _) do
-    command = Mariaex.Protocol.get_command(statement)
-    %Mariaex.Result{res | command: command, rows: nil}
+  def decode(_, {res, nil}, _) do
+    %Mariaex.Result{res | rows: nil}
   end
-  def decode(%Mariaex.Query{statement: statement}, {res, columns}, opts) do
-    command = Mariaex.Protocol.get_command(statement)
-    if command in @commands_without_rows do
-      %Mariaex.Result{res | command: command, rows: nil}
-    else
-      %Mariaex.Result{rows: rows} = res
-      decoded = do_decode(rows, opts)
-      include_table_name = opts[:include_table_name]
-      columns = for %Column{} = column <- columns, do: column_name(column, include_table_name)
-      %Mariaex.Result{res | command: command,
-                            rows: decoded,
-                            columns: columns,
-                            num_rows: length(decoded)}
-    end
+  def decode(_, {res, columns}, opts) do
+    %Mariaex.Result{rows: rows} = res
+    decoded = do_decode(rows, opts)
+    include_table_name = opts[:include_table_name]
+    columns = for %Column{} = column <- columns, do: column_name(column, include_table_name)
+    %Mariaex.Result{res | rows: decoded, columns: columns, num_rows: length(decoded)}
   end
 
   ## helpers
@@ -171,6 +200,20 @@ defimpl DBConnection.Query, for: Mariaex.Query do
   defp do_decode([], _, acc) do
     acc
   end
+
+  ## Geometry Helpers
+
+  defp encode_rings(coordinates, acc \\ <<>>)
+  defp encode_rings([coordinates | rest], acc) do
+    encode_rings(rest, << acc::binary, length(coordinates)::little-32, encode_coordinates(coordinates)::binary >>)
+  end
+  defp encode_rings([], acc), do: acc
+
+  defp encode_coordinates(coordinates, acc \\ <<>>)
+  defp encode_coordinates([{x, y} | rest], acc) do
+    encode_coordinates(rest, << acc::binary, x::little-float-64, y::little-float-64 >>)
+  end
+  defp encode_coordinates([], acc), do: acc
 end
 
 defimpl String.Chars, for: Mariaex.Query do
